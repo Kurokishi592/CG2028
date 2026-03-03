@@ -53,7 +53,7 @@ void SystemClock_Config(void);
 
 
 static void Buzzer_Init(void);
-static void Buzzer_PlayTone(uint16_t freq_hz);
+static void Buzzer_On(void);
 static void Buzzer_Off(void);
 static void update_alert_outputs(fall_event_t new_event); // Handles LED2 and Buzzer based on g_latched_event
 static void telebot_task(uint32_t now, fall_event_t event); // Handles Wifi and telebot messages every new NEARFALL/REALFALL
@@ -62,7 +62,6 @@ static void button_task(uint32_t now); // Handles user button to clear REAL_FALL
 
 
 UART_HandleTypeDef huart1;
-static TIM_HandleTypeDef htim3;  // TIM3 CH1 drives passive buzzer PWM on ARD_D5 (PB4)
 
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
 	if (GPIO_Pin == ISM43362_DRDY_EXTI1_Pin) {
@@ -381,64 +380,26 @@ static int WIFI_AppSendText(const char *text)
 
 
 
-/* ---------- Passive buzzer on ARD_D5 (PB4) via TIM3 CH1 PWM ---------- */
-
 static void Buzzer_Init(void)
 {
-	// Enable clocks
-	__HAL_RCC_TIM3_CLK_ENABLE();
-	__HAL_RCC_GPIOB_CLK_ENABLE();
-
-	// Configure PB4 as TIM3_CH1 alternate function (AF2)
 	GPIO_InitTypeDef GPIO_InitStruct = {0};
-	GPIO_InitStruct.Pin       = ARD_D5_Pin;
-	GPIO_InitStruct.Mode      = GPIO_MODE_AF_PP;
-	GPIO_InitStruct.Pull      = GPIO_NOPULL;
-	GPIO_InitStruct.Speed     = GPIO_SPEED_FREQ_HIGH;
-	GPIO_InitStruct.Alternate = GPIO_AF2_TIM3;
+	// Use ARD_D5 as a generic buzzer output pin (active-high)
+	GPIO_InitStruct.Pin = ARD_D5_Pin;
+	GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+	GPIO_InitStruct.Pull = GPIO_NOPULL;
+	GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
 	HAL_GPIO_Init(ARD_D5_GPIO_Port, &GPIO_InitStruct);
-
-	// Base timer config (will be reconfigured per-tone in Buzzer_PlayTone)
-	htim3.Instance               = TIM3;
-	htim3.Init.Prescaler         = 79;            // 80 MHz / 80 = 1 MHz tick
-	htim3.Init.CounterMode       = TIM_COUNTERMODE_UP;
-	htim3.Init.Period            = 999;            // default ~1 kHz
-	htim3.Init.ClockDivision     = TIM_CLOCKDIVISION_DIV1;
-	htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
-	HAL_TIM_PWM_Init(&htim3);
-
-	// Configure channel 1 in PWM mode 1
-	TIM_OC_InitTypeDef sConfig = {0};
-	sConfig.OCMode     = TIM_OCMODE_PWM1;
-	sConfig.Pulse      = 500;  // 50% duty (will be updated per-tone)
-	sConfig.OCPolarity = TIM_OCPOLARITY_HIGH;
-	sConfig.OCFastMode = TIM_OCFAST_DISABLE;
-	HAL_TIM_PWM_ConfigChannel(&htim3, &sConfig, TIM_CHANNEL_1);
+	HAL_GPIO_WritePin(ARD_D5_GPIO_Port, ARD_D5_Pin, GPIO_PIN_RESET);
 }
 
-/**
- * Start (or change) the tone on the passive buzzer.
- * @param freq_hz  Desired frequency in Hz (use NOTE_xx defines from tones.h).
- */
-static void Buzzer_PlayTone(uint16_t freq_hz)
+static void Buzzer_On(void)
 {
-	if (freq_hz == 0U) { Buzzer_Off(); return; }
-
-	// TIM3 tick = 80 MHz / (PSC+1) = 1 MHz.  Period = 1 MHz / freq_hz.
-	const uint32_t TIM_TICK = 1000000U;
-	uint32_t period = TIM_TICK / (uint32_t)freq_hz;
-	if (period == 0U) period = 1U;
-
-	__HAL_TIM_SET_AUTORELOAD(&htim3, period - 1U);
-	__HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, period / 2U);  // 50% duty
-	__HAL_TIM_SET_COUNTER(&htim3, 0U);
-
-	HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
+	HAL_GPIO_WritePin(ARD_D5_GPIO_Port, ARD_D5_Pin, GPIO_PIN_SET);
 }
 
 static void Buzzer_Off(void)
 {
-	HAL_TIM_PWM_Stop(&htim3, TIM_CHANNEL_1);
+	HAL_GPIO_WritePin(ARD_D5_GPIO_Port, ARD_D5_Pin, GPIO_PIN_RESET);
 }
 
 static void update_alert_outputs(fall_event_t new_event)
@@ -452,8 +413,11 @@ static void update_alert_outputs(fall_event_t new_event)
 
 	if (new_event == FALL_EVENT_REAL_FALL)
 	{
-		g_latched_event = FALL_EVENT_REAL_FALL;
-		g_latched_timestamp = now;
+		if (g_latched_event != FALL_EVENT_REAL_FALL)
+		{
+			g_latched_event = FALL_EVENT_REAL_FALL;
+			g_latched_timestamp = now;
+		}
 	}
 	else if (new_event == FALL_EVENT_NEAR_FALL && g_latched_event == FALL_EVENT_NONE)
 	{
@@ -473,18 +437,22 @@ static void update_alert_outputs(fall_event_t new_event)
 	static uint8_t  buzz_on = 0U;
 	static uint32_t last_led_toggle = 0U;
 	static uint8_t  led_on = 0U;
-	static uint8_t  tone_on = 0U;  // is the passive buzzer currently playing?
 
-	const uint32_t BUZZ_DELAY_MS     = 5000U; // buzzer escalates to beeping pattern 5s after REAL_FALL
-	const uint32_t BUZZ_ON_MS        = 120U;  // beep-on duration
-	const uint32_t BUZZ_OFF_MS       = 180U;  // beep-off duration
-	const uint32_t LED_REAL_PERIODMS = 200U;  // fast blink for REAL_FALL
-	const uint32_t LED_NEAR_PERIODMS = 600U;  // slower blink for NEAR_FALL
-	const uint32_t NEAR_TONE_MS      = 500U;  // short beep duration for near-fall
+	const uint32_t BUZZ_DELAY_MS     = 5000U;  // 5s silence after REAL_FALL
+	const uint32_t BUZZ_ON_MS        = 120U;   // beep-on duration (constant)
+	const uint32_t BUZZ_OFF_SLOW_MS  = 400U;   // slowest gap   (0-10s)
+	const uint32_t BUZZ_OFF_MID_MS   = 200U;   // middle gap    (10-20s)
+	const uint32_t BUZZ_OFF_FAST_MS  = 80U;    // fastest gap   (20-30s)
+	const uint32_t BUZZ_STEP_MS      = 10000U; // duration of each speed step
+	const uint32_t LED_REAL_PERIODMS = 200U;   // fast blink for REAL_FALL
+	const uint32_t LED_NEAR_PERIODMS = 600U;   // slower blink for NEAR_FALL
 
 	switch (g_latched_event)
 	{
 	case FALL_EVENT_REAL_FALL:
+	{
+		uint32_t elapsed = now - g_latched_timestamp;
+
 		// LED: fast blink
 		if ((now - last_led_toggle) >= LED_REAL_PERIODMS)
 		{
@@ -493,54 +461,49 @@ static void update_alert_outputs(fall_event_t new_event)
 			last_led_toggle = now;
 		}
 
-		// Buzzer: continuous alarm immediately, then escalate to beep pattern after delay
-		if ((now - g_latched_timestamp) < BUZZ_DELAY_MS)
+		// Buzzer: silent for first 5s, then beep with accelerating rate
+		if (elapsed < BUZZ_DELAY_MS)
 		{
-			// Continuous tone for first 5 seconds
-			if (!tone_on) { Buzzer_PlayTone(NOTE_A5); tone_on = 1U; }
+			Buzzer_Off();
+			buzz_on = 0U;
 			break;
 		}
-		// After 5s: beep pattern (on/off) at a higher-pitch alarm
-		if (!buzz_on)
-		{
-			if ((now - last_buzz_toggle) >= BUZZ_OFF_MS)
-			{
-				Buzzer_PlayTone(NOTE_A5);
-				buzz_on = 1U;
-				tone_on = 1U;
-				last_buzz_toggle = now;
-			}
-			else if (tone_on)
-			{
-				Buzzer_Off();
-				tone_on = 0U;
-			}
-		}
+
+		// Calculate current off-gap based on which 10s step we're in
+		uint32_t beep_elapsed = elapsed - BUZZ_DELAY_MS;
+		uint32_t current_off;
+		if (beep_elapsed < BUZZ_STEP_MS)
+			current_off = BUZZ_OFF_SLOW_MS;       // 0-10s: slowest
+		else if (beep_elapsed < 2U * BUZZ_STEP_MS)
+			current_off = BUZZ_OFF_MID_MS;         // 10-20s: middle
 		else
+			current_off = BUZZ_OFF_FAST_MS;        // 20s+: fastest
+
+		if (buzz_on)
 		{
 			if ((now - last_buzz_toggle) >= BUZZ_ON_MS)
 			{
 				Buzzer_Off();
 				buzz_on = 0U;
-				tone_on = 0U;
+				last_buzz_toggle = now;
+			}
+		}
+		else
+		{
+			if ((now - last_buzz_toggle) >= current_off)
+			{
+				Buzzer_On();
+				buzz_on = 1U;
 				last_buzz_toggle = now;
 			}
 		}
 		break;
+	}
 
 	case FALL_EVENT_NEAR_FALL:
-		// NEAR FALL: slow LED blink, short warning beep
-		if (!tone_on)
-		{
-			Buzzer_PlayTone(NOTE_C5);  // 523 Hz short warning
-			tone_on = 1U;
-		}
-		// Auto-stop the tone after NEAR_TONE_MS
-		if (tone_on && (now - g_latched_timestamp) >= NEAR_TONE_MS)
-		{
-			Buzzer_Off();
-			tone_on = 0U;
-		}
+		// NEAR FALL: slow LED blink, no buzzer
+		Buzzer_Off();
+		buzz_on = 0U;
 
 		if ((now - last_led_toggle) >= LED_NEAR_PERIODMS)
 		{
@@ -553,7 +516,7 @@ static void update_alert_outputs(fall_event_t new_event)
 	case FALL_EVENT_NONE:
 	default:
 		// NO FALL: everything off
-		if (tone_on) { Buzzer_Off(); tone_on = 0U; }
+		Buzzer_Off();
 		buzz_on = 0U;
 		BSP_LED_Off(LED2);
 		led_on = 0U;
