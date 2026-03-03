@@ -158,7 +158,9 @@ void get_baro_reading(sensors_t *sensors)
 }
 
 
-// Window used to determine instability based on recent accel/gyro magnitudes. Updated every iteration and used to derive recent range for fall detection. Uses a simple circular buffer approach.
+// Window used to determine instability based on recent accel/gyro magnitudes.
+// Updated every iteration and used to derive recent range for fall detection.
+// Uses a simple circular buffer approach.
 void fd_update_windows(float acc_mag, float gyro_mag)
 {
 	acc_mag_window[fd_win_idx]  = acc_mag;

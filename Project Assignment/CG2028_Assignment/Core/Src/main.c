@@ -27,7 +27,6 @@
 #include "../../Drivers/BSP/Components/spirit1/SPIRIT1_Library/Inc/SPIRIT_Irq.h"
 
 // Private headers
-// #include "wifi_service2.h"
 #include "wifi.h"
 #include "wifi_secrets.h"
 #include "lcd.h"
@@ -54,7 +53,7 @@ void SystemClock_Config(void);
 
 
 static void Buzzer_Init(void);
-static void Buzzer_On(void);
+static void Buzzer_PlayTone(uint16_t freq_hz);
 static void Buzzer_Off(void);
 static void update_alert_outputs(fall_event_t new_event); // Handles LED2 and Buzzer based on g_latched_event
 static void telebot_task(uint32_t now, fall_event_t event); // Handles Wifi and telebot messages every new NEARFALL/REALFALL
@@ -63,6 +62,7 @@ static void button_task(uint32_t now); // Handles user button to clear REAL_FALL
 
 
 UART_HandleTypeDef huart1;
+static TIM_HandleTypeDef htim3;  // TIM3 CH1 drives passive buzzer PWM on ARD_D5 (PB4)
 
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
 	if (GPIO_Pin == ISM43362_DRDY_EXTI1_Pin) {
@@ -120,6 +120,8 @@ static uint8_t g_real_fall_initial_pending = 0U;
 static uint32_t g_real_fall_start_tick = 0U;
 static uint32_t g_last_real_fall_report_tick = 0U;
 static uint32_t g_next_real_fall_report_tick = 0U;
+static uint8_t g_ack_pending = 0U;           // set when user presses button to acknowledge REAL_FALL
+static uint32_t g_ack_fall_duration_s = 0U;   // elapsed seconds at time of acknowledgment
 
 /* ---------------------------------------------------------------------------------------------------------- */
 
@@ -247,7 +249,7 @@ int main(void)
 			button_task(now);
 		}
 
-		if ((now - last_telebot_tick) >= TELEBOT_TASK_PERIOD_MS)
+		if (g_ack_pending || (now - last_telebot_tick) >= TELEBOT_TASK_PERIOD_MS)
 		{
 			last_telebot_tick = now;
 			telebot_task(now, g_latched_event);
@@ -354,21 +356,21 @@ static int WIFI_AppSendText(const char *text)
 		return -11;
 	}
 
-	uint16_t sent_len = 0;
-	WIFI_Status_t status = WIFI_SendData(g_wifi_socket, payload, (uint16_t)n, &sent_len, WIFI_SEND_TIMEOUT_MS);
-
-	if ((status == WIFI_STATUS_OK) && (sent_len == (uint16_t)n)) {
-		return 0;
-	}
-
+	// Always close and reopen the TCP connection before sending.
+	// The ESP32 proxy closes each client after forwarding a message
+	// (client.stop()), leaving the ISM43362 with a half-closed socket
+	// that may silently accept data into its send buffer without
+	// actually delivering it.  A fresh connection guarantees the
+	// ESP32 will see the new message.
 	(void)WIFI_CloseClientConnection(g_wifi_socket);
-	status = WIFI_OpenClientConnection(g_wifi_socket, WIFI_TCP_PROTOCOL, "conn", g_wifi_server_ip, ESP32_PROXY_PORT, 0);
+	WIFI_Status_t status = WIFI_OpenClientConnection(g_wifi_socket, WIFI_TCP_PROTOCOL, "conn", g_wifi_server_ip, ESP32_PROXY_PORT, 0);
 	if (status != WIFI_STATUS_OK) {
 		g_wifi_ready = 0;
 		return -12;
 	}
+	g_wifi_ready = 1;
 
-	sent_len = 0;
+	uint16_t sent_len = 0;
 	status = WIFI_SendData(g_wifi_socket, payload, (uint16_t)n, &sent_len, WIFI_SEND_TIMEOUT_MS);
 
 	if ((status == WIFI_STATUS_OK) && (sent_len == (uint16_t)n)) {
@@ -379,26 +381,64 @@ static int WIFI_AppSendText(const char *text)
 
 
 
+/* ---------- Passive buzzer on ARD_D5 (PB4) via TIM3 CH1 PWM ---------- */
+
 static void Buzzer_Init(void)
 {
+	// Enable clocks
+	__HAL_RCC_TIM3_CLK_ENABLE();
+	__HAL_RCC_GPIOB_CLK_ENABLE();
+
+	// Configure PB4 as TIM3_CH1 alternate function (AF2)
 	GPIO_InitTypeDef GPIO_InitStruct = {0};
-	// Use ARD_D5 as a generic buzzer output pin (active-high)
-	GPIO_InitStruct.Pin = ARD_D5_Pin;
-	GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-	GPIO_InitStruct.Pull = GPIO_NOPULL;
-	GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+	GPIO_InitStruct.Pin       = ARD_D5_Pin;
+	GPIO_InitStruct.Mode      = GPIO_MODE_AF_PP;
+	GPIO_InitStruct.Pull      = GPIO_NOPULL;
+	GPIO_InitStruct.Speed     = GPIO_SPEED_FREQ_HIGH;
+	GPIO_InitStruct.Alternate = GPIO_AF2_TIM3;
 	HAL_GPIO_Init(ARD_D5_GPIO_Port, &GPIO_InitStruct);
-	HAL_GPIO_WritePin(ARD_D5_GPIO_Port, ARD_D5_Pin, GPIO_PIN_RESET);
+
+	// Base timer config (will be reconfigured per-tone in Buzzer_PlayTone)
+	htim3.Instance               = TIM3;
+	htim3.Init.Prescaler         = 79;            // 80 MHz / 80 = 1 MHz tick
+	htim3.Init.CounterMode       = TIM_COUNTERMODE_UP;
+	htim3.Init.Period            = 999;            // default ~1 kHz
+	htim3.Init.ClockDivision     = TIM_CLOCKDIVISION_DIV1;
+	htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
+	HAL_TIM_PWM_Init(&htim3);
+
+	// Configure channel 1 in PWM mode 1
+	TIM_OC_InitTypeDef sConfig = {0};
+	sConfig.OCMode     = TIM_OCMODE_PWM1;
+	sConfig.Pulse      = 500;  // 50% duty (will be updated per-tone)
+	sConfig.OCPolarity = TIM_OCPOLARITY_HIGH;
+	sConfig.OCFastMode = TIM_OCFAST_DISABLE;
+	HAL_TIM_PWM_ConfigChannel(&htim3, &sConfig, TIM_CHANNEL_1);
 }
 
-static void Buzzer_On(void)
+/**
+ * Start (or change) the tone on the passive buzzer.
+ * @param freq_hz  Desired frequency in Hz (use NOTE_xx defines from tones.h).
+ */
+static void Buzzer_PlayTone(uint16_t freq_hz)
 {
-	HAL_GPIO_WritePin(ARD_D5_GPIO_Port, ARD_D5_Pin, GPIO_PIN_SET);
+	if (freq_hz == 0U) { Buzzer_Off(); return; }
+
+	// TIM3 tick = 80 MHz / (PSC+1) = 1 MHz.  Period = 1 MHz / freq_hz.
+	const uint32_t TIM_TICK = 1000000U;
+	uint32_t period = TIM_TICK / (uint32_t)freq_hz;
+	if (period == 0U) period = 1U;
+
+	__HAL_TIM_SET_AUTORELOAD(&htim3, period - 1U);
+	__HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, period / 2U);  // 50% duty
+	__HAL_TIM_SET_COUNTER(&htim3, 0U);
+
+	HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
 }
 
 static void Buzzer_Off(void)
 {
-	HAL_GPIO_WritePin(ARD_D5_GPIO_Port, ARD_D5_Pin, GPIO_PIN_RESET);
+	HAL_TIM_PWM_Stop(&htim3, TIM_CHANNEL_1);
 }
 
 static void update_alert_outputs(fall_event_t new_event)
@@ -433,12 +473,14 @@ static void update_alert_outputs(fall_event_t new_event)
 	static uint8_t  buzz_on = 0U;
 	static uint32_t last_led_toggle = 0U;
 	static uint8_t  led_on = 0U;
+	static uint8_t  tone_on = 0U;  // is the passive buzzer currently playing?
 
-	const uint32_t BUZZ_DELAY_MS     = 5000U; // buzzer starts 5s after REAL_FALL
-	const uint32_t BUZZ_ON_MS        = 120U;  // buzzer on duration
-	const uint32_t BUZZ_OFF_MS       = 180U;  // buzzer off duration
+	const uint32_t BUZZ_DELAY_MS     = 5000U; // buzzer escalates to beeping pattern 5s after REAL_FALL
+	const uint32_t BUZZ_ON_MS        = 120U;  // beep-on duration
+	const uint32_t BUZZ_OFF_MS       = 180U;  // beep-off duration
 	const uint32_t LED_REAL_PERIODMS = 200U;  // fast blink for REAL_FALL
 	const uint32_t LED_NEAR_PERIODMS = 600U;  // slower blink for NEAR_FALL
+	const uint32_t NEAR_TONE_MS      = 500U;  // short beep duration for near-fall
 
 	switch (g_latched_event)
 	{
@@ -451,20 +493,27 @@ static void update_alert_outputs(fall_event_t new_event)
 			last_led_toggle = now;
 		}
 
-		// Buzzer: start beeping only after delay from event
+		// Buzzer: continuous alarm immediately, then escalate to beep pattern after delay
 		if ((now - g_latched_timestamp) < BUZZ_DELAY_MS)
 		{
-			Buzzer_Off();
-			buzz_on = 0U;
+			// Continuous tone for first 5 seconds
+			if (!tone_on) { Buzzer_PlayTone(NOTE_A5); tone_on = 1U; }
 			break;
 		}
+		// After 5s: beep pattern (on/off) at a higher-pitch alarm
 		if (!buzz_on)
 		{
 			if ((now - last_buzz_toggle) >= BUZZ_OFF_MS)
 			{
-				Buzzer_On();
+				Buzzer_PlayTone(NOTE_A5);
 				buzz_on = 1U;
+				tone_on = 1U;
 				last_buzz_toggle = now;
+			}
+			else if (tone_on)
+			{
+				Buzzer_Off();
+				tone_on = 0U;
 			}
 		}
 		else
@@ -473,15 +522,26 @@ static void update_alert_outputs(fall_event_t new_event)
 			{
 				Buzzer_Off();
 				buzz_on = 0U;
+				tone_on = 0U;
 				last_buzz_toggle = now;
 			}
 		}
 		break;
 
 	case FALL_EVENT_NEAR_FALL:
-		// NEAR FALL: slow LED blink, no buzzer
-		Buzzer_Off();
-		buzz_on = 0U;
+		// NEAR FALL: slow LED blink, short warning beep
+		if (!tone_on)
+		{
+			Buzzer_PlayTone(NOTE_C5);  // 523 Hz short warning
+			tone_on = 1U;
+		}
+		// Auto-stop the tone after NEAR_TONE_MS
+		if (tone_on && (now - g_latched_timestamp) >= NEAR_TONE_MS)
+		{
+			Buzzer_Off();
+			tone_on = 0U;
+		}
+
 		if ((now - last_led_toggle) >= LED_NEAR_PERIODMS)
 		{
 			if (led_on) { BSP_LED_Off(LED2); led_on = 0U; }
@@ -493,7 +553,7 @@ static void update_alert_outputs(fall_event_t new_event)
 	case FALL_EVENT_NONE:
 	default:
 		// NO FALL: everything off
-		Buzzer_Off();
+		if (tone_on) { Buzzer_Off(); tone_on = 0U; }
 		buzz_on = 0U;
 		BSP_LED_Off(LED2);
 		led_on = 0U;
@@ -537,6 +597,17 @@ static void button_task(uint32_t now)
 			}
 			if (button_press_ticks >= BUTTON_RESET_TICKS_REQUIRED)
 			{
+			// Record how long the fall lasted before acknowledgment
+			if (g_real_fall_start_tick != 0U)
+			{
+				g_ack_fall_duration_s = (now - g_real_fall_start_tick) / 1000U;
+			}
+			else
+			{
+				g_ack_fall_duration_s = 0U;
+			}
+			g_ack_pending = 1U;  // signal telebot_task to send ack immediately
+
 			// Clear latched REAL_FALL and re-arm detector
 			g_latched_event = FALL_EVENT_NONE;
 			g_current_event = FALL_EVENT_NONE;
@@ -573,6 +644,28 @@ static void telebot_task(uint32_t now, fall_event_t event)
 	static uint32_t last_attempt_tick = 0U;
 	char real_fall_msg[96];
 	uint32_t retry_interval_ms = g_wifi_ready ? 200U : 1000U;
+
+	// Handle button acknowledgment message (highest priority, no delay)
+	if (g_ack_pending)
+	{
+		uint32_t mins = g_ack_fall_duration_s / 60U;
+		uint32_t secs = g_ack_fall_duration_s % 60U;
+		snprintf(real_fall_msg, sizeof(real_fall_msg),
+			"Button pressed, hard fall alert acknowledged. Fall lasted %lu min %lu sec",
+			(unsigned long)mins, (unsigned long)secs);
+
+		if (WIFI_AppSendText(real_fall_msg) == 0)
+		{
+			g_ack_pending = 0U;
+			last_attempt_tick = now;
+		}
+		else if ((now - last_attempt_tick) >= retry_interval_ms)
+		{
+			// retry next cycle
+			last_attempt_tick = now;
+		}
+		return;
+	}
 
 	if (g_real_fall_active)
 	{
