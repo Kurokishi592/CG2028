@@ -20,7 +20,6 @@
 #include <stdbool.h>
 
 // Drivers and BSP headers for peripherals
-
 #include "../../Drivers/BSP/B-L4S5I-IOT01/stm32l4s5i_iot01.h"
 #include "../../Drivers/BSP/Components/spirit1/SPIRIT1_Library/Inc/SPIRIT_Types.h"
 #include "../../Drivers/BSP/Components/spirit1/SPIRIT1_Library/Inc/SPIRIT_PktBasic.h"
@@ -35,19 +34,17 @@
 #include "sensors.h"
 
 #ifdef DEBUG
-#define FALL_DEBUG 1
+#define FALL_DEBUG 0
 #endif
-
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
 
 static void init(void);
-void blink_LED2(int delay_ms);
 static void UART1_Init(void);
 static int WIFI_AppSendText(const char *text);
-extern void initialise_monitor_handles(void);	// for semi-hosting support (printf). Will not be required if transmitting via UART
+extern void initialise_monitor_handles(void);
 void SPI_WIFI_ISR(void);
 void SystemClock_Config(void);
 
@@ -55,16 +52,17 @@ void SystemClock_Config(void);
 static void Buzzer_Init(void);
 static void Buzzer_On(void);
 static void Buzzer_Off(void);
-static void update_alert_outputs(fall_event_t new_event); // Handles LED2 and Buzzer based on g_latched_event
-static void telebot_task(uint32_t now, fall_event_t event); // Handles Wifi and telebot messages every new NEARFALL/REALFALL
-static void oled_task(uint32_t now, sensors_t sensor_readings, fall_event_t event); // Handles OLED texts
-static void button_task(uint32_t now); // Handles user button to clear REAL_FALL latch
+static void update_alert_outputs(fall_event_t new_event); 								// Handles LED2 and Buzzer based on g_latched_event
+static void telebot_task(uint32_t now, fall_event_t event); 							// Handles Wifi and telebot messages every new NEARFALL/REALFALL
+static void oled_task(uint32_t now, sensors_t sensor_readings, fall_event_t event); 	// Handles OLED texts
+static void button_task(uint32_t now); 													// Handles user button to clear REAL_FALL latch
 
 
-UART_HandleTypeDef huart1;
+UART_HandleTypeDef huart1;				// UART handler for debug printing to Serial Monitor
 
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
-	if (GPIO_Pin == ISM43362_DRDY_EXTI1_Pin) {
+	if (GPIO_Pin == ISM43362_DRDY_EXTI1_Pin)
+	{
 		SPI_WIFI_ISR();
 	}
 }
@@ -74,7 +72,8 @@ void Error_Handler(void)
   /* User can add his own implementation to report the HAL error return state */
   while(1) 
   {
-	blink_LED2(100);
+	BSP_LED_Toggle(LED2);
+	HAL_Delay(100);
   }
 }
 
@@ -119,8 +118,8 @@ static uint8_t g_real_fall_initial_pending = 0U;
 static uint32_t g_real_fall_start_tick = 0U;
 static uint32_t g_last_real_fall_report_tick = 0U;
 static uint32_t g_next_real_fall_report_tick = 0U;
-static uint8_t g_ack_pending = 0U;           // set when user presses button to acknowledge REAL_FALL
-static uint32_t g_ack_fall_duration_s = 0U;   // elapsed seconds at time of acknowledgment
+static uint8_t g_ack_pending = 0U;           		// set when user presses button to acknowledge REAL_FALL
+static uint32_t g_ack_fall_duration_s = 0U;   		// elapsed seconds at time of acknowledgment
 
 /* ---------------------------------------------------------------------------------------------------------- */
 
@@ -143,7 +142,7 @@ int main(void)
 	while (1)
 	{
 		uint32_t now = HAL_GetTick();
-		fall_event_t fall_event = g_current_event; // snapshot for this loop
+		fall_event_t fall_event = g_current_event;	// snapshot for this loop
 
 		// -------------------------------------- SENSOR SAMPLING + FALL DETECTION (TIMED) -------------------------------------- //
 		if ((now - g_last_sample_tick) >= SENSOR_SAMPLE_PERIOD_MS)
@@ -154,7 +153,6 @@ int main(void)
 			fall_event_t new_event = FALL_EVENT_NONE;
 			get_IMU_reading(i, &sensor_readings);
 			get_baro_reading(&sensor_readings);
-			
 			
 			if (i >= 3 && g_detector_enabled)
 			{
@@ -171,23 +169,24 @@ int main(void)
 						g_current_event_timestamp = now;
 						fall_event = new_event;
 						
-						// Once we see a REAL_FALL, pause the detector until
-						// the user acknowledges via the button.
+						// Upon REAL_FALL, pause detector until user acknowledges via the button.
 						if (new_event == FALL_EVENT_REAL_FALL)
 						{
-							g_detector_enabled = 0U;
-							g_real_fall_active = 1U;
-							g_real_fall_initial_pending = 1U;
-							g_real_fall_start_tick = now;
-							g_last_real_fall_report_tick = 0U;
-							g_next_real_fall_report_tick = now + REAL_FALL_REPORT_PERIOD_MS;
+							g_detector_enabled = 0U;												// Disable fall detection until acknowledgment
+							g_real_fall_active = 1U;												// Set REAL_FALL active flag to signify state
+							g_real_fall_initial_pending = 1U;										// Set pending flag to trigger immediate alert for REAL_FALL
+							g_real_fall_start_tick = now;											// Start timing REAL_FALL duration from now
+							g_last_real_fall_report_tick = 0U;										// Report REAL_FALL at time now
+							g_next_real_fall_report_tick = now + REAL_FALL_REPORT_PERIOD_MS;		// Set next report time
 						}
-
+						
+						// Upon NEAR_FALL, send message, set alert pending flag
 						if (new_event == FALL_EVENT_NEAR_FALL)
 						{
 							g_pending_alert_msg = NEAR_FALL_STR;
 							g_alert_pending = 1U;
 						}
+						// If a REAL_FALL is detected during NEAR_FALL, change state to REAL_FALL instead
 						else if (new_event == FALL_EVENT_REAL_FALL)
 						{
 							g_pending_alert_msg = NULL;
@@ -235,7 +234,7 @@ int main(void)
 			i++;
 		}
 
-		// -------------------------------------- NON-BLOCKING TASKS (TIMESLICED) -------------------------------------- //
+		/* -------------------------------------- NON-BLOCKING TASKS (TIMESLICED) ------------------------------------- */
 		if ((now - last_alert_tick) >= ALERT_TASK_PERIOD_MS)
 		{
 			last_alert_tick = now;
@@ -262,6 +261,9 @@ int main(void)
 	}
 }
 
+/**
+ * @brief  Initialize sensors, peripherals and display
+ */
 static void init (void)
 {
 	HAL_Init();													// Reset all peripherals, initialize flash interface and systick
@@ -274,39 +276,40 @@ static void init (void)
 
 	// Peripheral initializations using BSP functions
 	BSP_LED_Init(LED2);
-	// BSP_ACCELERO_Init();
-	// BSP_PSENSOR_Init();
-	// BSP_GYRO_Init();
 	Buzzer_Init();
-	// BSP_MAGNETO_Init();
 	sensors_init();
 	BSP_LED_Off(LED2);											// Set the initial LED state to off
 	BSP_PB_Init(BUTTON_USER, BUTTON_MODE_GPIO);					// Initialize user button
 	
-	// Initialize Wi-Fi module, connect to ESP32 
-	char wifi_status_buf[100];
+	// Initialize Wi-Fi module, connect to ESP32 - uncomment for debugging
+	// char wifi_status_buf[100];
 	
-	int status_len_1 = sprintf(wifi_status_buf, "Device initialized\r\n");
-	if (status_len_1 > 0) {
-		HAL_UART_Transmit(&huart1, (uint8_t*)wifi_status_buf, (uint16_t)status_len_1, HAL_MAX_DELAY);
-	}
+	// int status_len_1 = sprintf(wifi_status_buf, "Device initialized\r\n");
+	// if (status_len_1 > 0) {
+	// 	HAL_UART_Transmit(&huart1, (uint8_t*)wifi_status_buf, (uint16_t)status_len_1, HAL_MAX_DELAY);
+	// }
 
+	// Connect to Wi-Fi network 
 	WIFI_Status_t wifi_status = WIFI_Init();
 
 	wifi_status = WIFI_Connect(WIFI_SSID, WIFI_PASSWORD, WIFI_ECN_WPA2_PSK);
 	lcd_clear(LCD_COLOR_WHITE);
 	lcd_draw_text(65, 120, "Connecting", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 2);
 	lcd_draw_text(50, 160, "to Wi-Fi...", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 2);
-	if (wifi_status != WIFI_STATUS_OK) {
+	if (wifi_status != WIFI_STATUS_OK)
+	{
 		g_wifi_ready = 0;
 		return;
 	}
+
+	// Connect to ESP32 proxy server, with fixed IP address
 	unsigned int a = 0;
 	unsigned int b = 0;
 	unsigned int c = 0;
 	unsigned int d = 0;
 	char tail = '\0';
-	if (sscanf(ESP32_PROXY_HOST, "%u.%u.%u.%u%c", &a, &b, &c, &d, &tail) == 4) {
+	if (sscanf(ESP32_PROXY_HOST, "%u.%u.%u.%u%c", &a, &b, &c, &d, &tail) == 4)
+	{
 		g_wifi_server_ip[0] = (uint8_t)a;
 		g_wifi_server_ip[1] = (uint8_t)b;
 		g_wifi_server_ip[2] = (uint8_t)c;
@@ -314,16 +317,20 @@ static void init (void)
 	}
 	
 	wifi_status = WIFI_OpenClientConnection(g_wifi_socket, WIFI_TCP_PROTOCOL, "conn", g_wifi_server_ip, ESP32_PROXY_PORT, 0);
-	if (wifi_status != WIFI_STATUS_OK) {
+	if (wifi_status != WIFI_STATUS_OK)
+	{
 		g_wifi_ready = 0;
 		return;
-	} else {
+	} else
+	{
 		g_wifi_ready = 1;
 	}
+
 	lcd_clear(LCD_COLOR_GREEN);
 	lcd_draw_text(65, 130, "Wi-Fi", LCD_COLOR_BLACK, LCD_COLOR_GREEN, 3);
 	lcd_draw_text(30, 170, "Connected!", LCD_COLOR_BLACK, LCD_COLOR_GREEN, 3);
 	HAL_Delay(500);
+
 	lcd_clear(LCD_COLOR_WHITE);
 	lcd_draw_text(75, 20, "Fall", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 4);
 	lcd_draw_text(15, 60, "Detection", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 4);
@@ -333,37 +340,43 @@ static void init (void)
 	lcd_draw_text(30, 175, "00.00", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 2);
 	lcd_draw_text(150, 150, "Gyro", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 2);
 	lcd_draw_text(135, 175, "0000.00", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 2);
-	lcd_draw_text(25, 215, "Roll", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 2);
-	lcd_draw_text(25, 240, "00.0", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 2);
-	lcd_draw_text(90, 215, "Pitch", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 2);
-	lcd_draw_text(95, 240, "00.0", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 2);
-	lcd_draw_text(175, 215, "Yaw", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 2);
-	lcd_draw_text(165, 240, "00.0", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 2);
+	lcd_draw_text(20, 215, "Roll", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 2);
+	lcd_draw_text(15, 240, "00.0", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 2);
+	lcd_draw_text(85, 215, "Pitch", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 2);
+	lcd_draw_text(90, 240, "00.0", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 2);
+	lcd_draw_text(165, 215, "Baro", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 2);
+	lcd_draw_text(150, 240, "0000.0", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 2);
 }
 
+/**
+ * @brief Send text to ESP32, which will be forwarded to the Telegram bot
+ */
 static int WIFI_AppSendText(const char *text)
 {
 	const uint32_t WIFI_SEND_TIMEOUT_MS = 100U;
 
-	if (text == NULL) {
+	if (text == NULL)
+	{
 		return -10;
 	}
 
 	uint8_t payload[128];
 	int n = snprintf((char *)payload, sizeof(payload), "%s\n", text);
-	if ((n <= 0) || (n >= (int)sizeof(payload))) {
+	if ((n <= 0) || (n >= (int)sizeof(payload)))
+	{
 		return -11;
 	}
 
-	// Always close and reopen the TCP connection before sending.
+	// Always close and reopen the TCP connection before sending
 	// The ESP32 proxy closes each client after forwarding a message
 	// (client.stop()), leaving the ISM43362 with a half-closed socket
 	// that may silently accept data into its send buffer without
-	// actually delivering it.  A fresh connection guarantees the
-	// ESP32 will see the new message.
+	// actually delivering it, a fresh connection guarantees the
+	// ESP32 will see the new message
 	(void)WIFI_CloseClientConnection(g_wifi_socket);
 	WIFI_Status_t status = WIFI_OpenClientConnection(g_wifi_socket, WIFI_TCP_PROTOCOL, "conn", g_wifi_server_ip, ESP32_PROXY_PORT, 0);
-	if (status != WIFI_STATUS_OK) {
+	if (status != WIFI_STATUS_OK)
+	{
 		g_wifi_ready = 0;
 		return -12;
 	}
@@ -372,14 +385,16 @@ static int WIFI_AppSendText(const char *text)
 	uint16_t sent_len = 0;
 	status = WIFI_SendData(g_wifi_socket, payload, (uint16_t)n, &sent_len, WIFI_SEND_TIMEOUT_MS);
 
-	if ((status == WIFI_STATUS_OK) && (sent_len == (uint16_t)n)) {
+	if ((status == WIFI_STATUS_OK) && (sent_len == (uint16_t)n))
+	{
 		return 0;
 	}
 	return -13;
 }
 
-
-
+/**
+ * @brief Initialize buzzer GPIO pin, set initial state to off
+ */
 static void Buzzer_Init(void)
 {
 	GPIO_InitTypeDef GPIO_InitStruct = {0};
@@ -392,28 +407,38 @@ static void Buzzer_Init(void)
 	HAL_GPIO_WritePin(ARD_D5_GPIO_Port, ARD_D5_Pin, GPIO_PIN_RESET);
 }
 
+/**
+ * @brief Helper function to turn on the buzzer
+ */
 static void Buzzer_On(void)
 {
 	HAL_GPIO_WritePin(ARD_D5_GPIO_Port, ARD_D5_Pin, GPIO_PIN_SET);
 }
 
+/**
+ * @brief Helper function to turn off the buzzer
+ */
 static void Buzzer_Off(void)
 {
 	HAL_GPIO_WritePin(ARD_D5_GPIO_Port, ARD_D5_Pin, GPIO_PIN_RESET);
 }
 
+/**
+ * @brief Update alert outputs (LED2 and buzzer) based on the current latched event state
+ * Implements non-blocking behavior for buzzer patterns
+ * @param new_event Newly classified fall event to update outputs with
+ */
 static void update_alert_outputs(fall_event_t new_event)
 {
 	uint32_t now = HAL_GetTick();
 
-	// Latch events to avoid flicker; REAL_FALL stays latched
-	// until cleared by the user button, NEAR_FALL auto-clears.
-	// const uint32_t REAL_FALL_LATCH_MS = 0U;   // unused now
+	// Latch events to avoid hysteresis; REAL_FALL stays latched until
+	// cleared by the user button, NEAR_FALL auto-clears if no REAL_FALL occurs.
 	const uint32_t NEAR_FALL_LATCH_MS = 2000U;
 
 	if (new_event == FALL_EVENT_REAL_FALL)
 	{
-		if (g_latched_event != FALL_EVENT_REAL_FALL)
+		if (g_latched_event != FALL_EVENT_REAL_FALL)			// Safeguard to prevent resetting REAL_FALL timer
 		{
 			g_latched_event = FALL_EVENT_REAL_FALL;
 			g_latched_timestamp = now;
@@ -425,8 +450,7 @@ static void update_alert_outputs(fall_event_t new_event)
 		g_latched_timestamp = now;
 	}
 
-	// Auto-clear only NEAR_FALL latches after timeout; REAL_FALL
-	// is cleared by button_task() when the user acknowledges.
+	// Automatic clear of NEAR_FALL latch after timeout
 	if (g_latched_event == FALL_EVENT_NEAR_FALL && (now - g_latched_timestamp) > NEAR_FALL_LATCH_MS)
 	{
 		g_latched_event = FALL_EVENT_NONE;
@@ -438,18 +462,19 @@ static void update_alert_outputs(fall_event_t new_event)
 	static uint32_t last_led_toggle = 0U;
 	static uint8_t  led_on = 0U;
 
-	const uint32_t BUZZ_DELAY_MS     = 5000U;  // 5s silence after REAL_FALL
+	const uint32_t BUZZ_DELAY_MS     = 5000U;  // 5s silence period
 	const uint32_t BUZZ_ON_MS        = 120U;   // beep-on duration (constant)
-	const uint32_t BUZZ_OFF_SLOW_MS  = 400U;   // slowest gap   (0-10s)
-	const uint32_t BUZZ_OFF_MID_MS   = 200U;   // middle gap    (10-20s)
-	const uint32_t BUZZ_OFF_FAST_MS  = 80U;    // fastest gap   (20-30s)
-	const uint32_t BUZZ_STEP_MS      = 10000U; // duration of each speed step
+	const uint32_t BUZZ_OFF_SLOW_MS  = 400U;   // slowest beep (5-15s)
+	const uint32_t BUZZ_OFF_MID_MS   = 200U;   // middle beep  (15-25s)
+	const uint32_t BUZZ_OFF_FAST_MS  = 80U;    // fastest beep   (>25s)
+	const uint32_t BUZZ_STEP_MS      = 10000U; // 10s between each change
 	const uint32_t LED_REAL_PERIODMS = 200U;   // fast blink for REAL_FALL
 	const uint32_t LED_NEAR_PERIODMS = 600U;   // slower blink for NEAR_FALL
 
 	switch (g_latched_event)
 	{
 	case FALL_EVENT_REAL_FALL:
+	// REAL FALL: fast LED blink + buzzer
 	{
 		uint32_t elapsed = now - g_latched_timestamp;
 
@@ -473,11 +498,11 @@ static void update_alert_outputs(fall_event_t new_event)
 		uint32_t beep_elapsed = elapsed - BUZZ_DELAY_MS;
 		uint32_t current_off;
 		if (beep_elapsed < BUZZ_STEP_MS)
-			current_off = BUZZ_OFF_SLOW_MS;       // 0-10s: slowest
+			current_off = BUZZ_OFF_SLOW_MS;			// 5-15s: slowest
 		else if (beep_elapsed < 2U * BUZZ_STEP_MS)
-			current_off = BUZZ_OFF_MID_MS;         // 10-20s: middle
+			current_off = BUZZ_OFF_MID_MS;			// 15-25s: middle
 		else
-			current_off = BUZZ_OFF_FAST_MS;        // 20s+: fastest
+			current_off = BUZZ_OFF_FAST_MS;			// >25s: fastest
 
 		if (buzz_on)
 		{
@@ -507,8 +532,15 @@ static void update_alert_outputs(fall_event_t new_event)
 
 		if ((now - last_led_toggle) >= LED_NEAR_PERIODMS)
 		{
-			if (led_on) { BSP_LED_Off(LED2); led_on = 0U; }
-			else       { BSP_LED_On(LED2);  led_on = 1U; }
+			if (led_on)
+			{
+				BSP_LED_Off(LED2);
+				led_on = 0U;
+			} else
+			{
+				BSP_LED_On(LED2);
+				led_on = 1U;
+			}
 			last_led_toggle = now;
 		}
 		break;
@@ -524,10 +556,12 @@ static void update_alert_outputs(fall_event_t new_event)
 	}
 }
 
-// User button task: clears latched REAL_FALL on a *press*,
-// not a long hold, but still debounces using the original
-// "release to arm, then a few consecutive pressed samples"
-// pattern. Non-blocking.
+/**
+ * @brief Task to handle user button presses to acknowledge REAL_FALL events
+ * Implements a debounce mechanism and requires a short press (not long hold) to acknowledge
+ * Calculates how long the REAL_FALL lasted before acknowledgment
+ * @param now Current tick count for timing purposes
+ */
 static void button_task(uint32_t now)
 {
 	(void)now; // not used, we debounce by counts instead of time
@@ -592,15 +626,16 @@ static void button_task(uint32_t now)
 	{
 		button_was_down = 0U;
 		button_press_ticks = 0U;
-		// A clean release "arms" the reset; the next
-		// short press that is stable for a couple of
-		// samples will be treated as an
-		// acknowledgement to clear REAL_FALL.
-		button_reset_armed = 1U;
+		button_reset_armed = 1U;	// Re-arm reset on next press after release
 	}
 }
 
-// Telebot / Wi-Fi reporting task: send once per event change
+/**
+ * @brief Task to handle sending messages to the ESP32 proxy for Telegram bot forwarding
+ * Prioritizes acknowledgment messages, then REAL_FALL reports, then NEAR_FALL reports
+ * @param now Current tick count for timing purposes
+ * @param event The most recently classified fall event
+ */
 static void telebot_task(uint32_t now, fall_event_t event)
 {
 	(void)event;
@@ -622,14 +657,14 @@ static void telebot_task(uint32_t now, fall_event_t event)
 			g_ack_pending = 0U;
 			last_attempt_tick = now;
 		}
-		else if ((now - last_attempt_tick) >= retry_interval_ms)
+		else if ((now - last_attempt_tick) >= retry_interval_ms)		// Retry next cycle if message did not send
 		{
-			// retry next cycle
 			last_attempt_tick = now;
 		}
 		return;
 	}
 
+	// Handle REAL_FALL state - immediate report, then every REAL_FALL_REPORT_PERIOD_MS while still active
 	if (g_real_fall_active)
 	{
 		uint8_t report_due = g_real_fall_initial_pending ||
@@ -671,16 +706,19 @@ static void telebot_task(uint32_t now, fall_event_t event)
 		}
 	}
 
+	// If no message to send, free up CPU by returning early
 	if (!g_alert_pending || g_pending_alert_msg == NULL)
 	{
 		return;
 	}
 
+	// For REAL_FALL, if message recently sent, wait for retry interval before sending next
 	if ((now - last_attempt_tick) < retry_interval_ms)
 	{
 		return;
 	}
 
+	// Attempt to send pending g_pending_alert_msg, clears g_alert_pending flag if successful
 	last_attempt_tick = now;
 	if (WIFI_AppSendText(g_pending_alert_msg) == 0)
 	{
@@ -689,7 +727,13 @@ static void telebot_task(uint32_t now, fall_event_t event)
 	}
 }
 
-// OLED update task: update display only when classification changes
+/**
+ * @brief Task to handle updating the OLED display with sensor readings and fall event information
+ * Prioritizes showing REAL_FALL state, then NEAR_FALL, then sensor readings
+ * @param now Current tick count for timing purposes
+ * @param sensor_readings The most recent sensor readings to display
+ * @param event The most recently classified fall event for background color
+ */
 static void oled_task(uint32_t now, sensors_t sensor_readings, fall_event_t event)
 {
 	uint32_t slice_start = HAL_GetTick();
@@ -700,7 +744,7 @@ static void oled_task(uint32_t now, sensors_t sensor_readings, fall_event_t even
 	char gyro_str[24];
 	char roll_str[12];
 	char pitch_str[12];
-	char yaw_str[12];
+	char baro_str[12];
 	static bool updateState = false;
 	static fall_event_t prevEvent = FALL_EVENT_NONE;
 	static uint16_t bg_color = LCD_COLOR_WHITE;
@@ -709,7 +753,7 @@ static void oled_task(uint32_t now, sensors_t sensor_readings, fall_event_t even
 	snprintf(gyro_str, sizeof(gyro_str), "%05.2f", sensor_readings.gyro_magnitude_asm);
 	snprintf(roll_str, sizeof(roll_str), "%.1f", sensor_readings.roll_pitch_yaw[0]);
 	snprintf(pitch_str, sizeof(pitch_str), "%.1f", sensor_readings.roll_pitch_yaw[1]);
-	snprintf(yaw_str, sizeof(yaw_str), "%.1f", sensor_readings.roll_pitch_yaw[2]);
+	snprintf(baro_str, sizeof(baro_str), "%.1f", sensor_readings.pressure_hpa);
 
 	
 	lcd_draw_text(35, 150, "Accel", LCD_COLOR_BLACK, bg_color, 2);
@@ -718,14 +762,14 @@ static void oled_task(uint32_t now, sensors_t sensor_readings, fall_event_t even
 	lcd_draw_text(150, 150, "Gyro", LCD_COLOR_BLACK, bg_color, 2);
 	lcd_draw_text(135, 175, gyro_str, LCD_COLOR_BLACK, bg_color, 2);
 	if ((HAL_GetTick() - slice_start) >= OLED_TASK_BUDGET_MS) return;
-	lcd_draw_text(25, 215, "Roll", LCD_COLOR_BLACK, bg_color, 2);
-	lcd_draw_text(20, 240, roll_str, LCD_COLOR_BLACK, bg_color, 2);
+	lcd_draw_text(20, 215, "Roll", LCD_COLOR_BLACK, bg_color, 2);
+	lcd_draw_text(15, 240, roll_str, LCD_COLOR_BLACK, bg_color, 2);
 	if ((HAL_GetTick() - slice_start) >= OLED_TASK_BUDGET_MS) return;
-	lcd_draw_text(90, 215, "Pitch", LCD_COLOR_BLACK, bg_color, 2);
-	lcd_draw_text(95, 240, pitch_str, LCD_COLOR_BLACK, bg_color, 2);
+	lcd_draw_text(85, 215, "Pitch", LCD_COLOR_BLACK, bg_color, 2);
+	lcd_draw_text(90, 240, pitch_str, LCD_COLOR_BLACK, bg_color, 2);
 	if ((HAL_GetTick() - slice_start) >= OLED_TASK_BUDGET_MS) return;
-	lcd_draw_text(175, 215, "Yaw", LCD_COLOR_BLACK, bg_color, 2);
-	lcd_draw_text(165, 240, yaw_str, LCD_COLOR_BLACK, bg_color, 2);
+	lcd_draw_text(165, 215, "Baro", LCD_COLOR_BLACK, bg_color, 2);
+	lcd_draw_text(150, 240, baro_str, LCD_COLOR_BLACK, bg_color, 2);
 
 	if (event == FALL_EVENT_NEAR_FALL && updateState)
 	{
@@ -798,6 +842,9 @@ static void UART1_Init(void)
 
 }
 
+/**
+ * @brief  System Clock Configuration
+ */
 void SystemClock_Config(void)
 {
   /* oscillator and clocks configs */
@@ -852,17 +899,6 @@ void SystemClock_Config(void)
     Error_Handler();
   }
 }
-
-/**
- * Helper function for LED blinking
- * @param delay_ms: Delay in milliseconds between toggles
- */
-void blink_LED2(int delay_ms)
-{
-	BSP_LED_Toggle(LED2);
-	HAL_Delay(delay_ms);
-}
-
 
 // Do not modify these lines of code. They are written to supress UART related warnings
 int _read(int file, char *ptr, int len) { return 0; }
