@@ -105,7 +105,7 @@ static uint32_t g_last_sample_tick = 0U;
 #define OLED_TASK_BUDGET_MS 200U
 #define REAL_FALL_REPORT_PERIOD_MS 15000U
 
-const char* NEAR_FALL_STR = "Near fall detected!";
+const char* NEAR_FALL_STR = "Sudden movement detected!";
 const char* REAL_FALL_STR = "Real fall detected!";
 
 static uint8_t g_wifi_server_ip[4] = {0};
@@ -345,7 +345,7 @@ static void init (void)
 	lcd_draw_text(85, 215, "Pitch", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 2);
 	lcd_draw_text(90, 240, "00.0", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 2);
 	lcd_draw_text(165, 215, "Baro", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 2);
-	lcd_draw_text(150, 240, "0000.0", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 2);
+	lcd_draw_text(155, 240, "0000.0", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 2);
 }
 
 /**
@@ -769,7 +769,7 @@ static void oled_task(uint32_t now, sensors_t sensor_readings, fall_event_t even
 	lcd_draw_text(90, 240, pitch_str, LCD_COLOR_BLACK, bg_color, 2);
 	if ((HAL_GetTick() - slice_start) >= OLED_TASK_BUDGET_MS) return;
 	lcd_draw_text(165, 215, "Baro", LCD_COLOR_BLACK, bg_color, 2);
-	lcd_draw_text(150, 240, baro_str, LCD_COLOR_BLACK, bg_color, 2);
+	lcd_draw_text(155, 240, baro_str, LCD_COLOR_BLACK, bg_color, 2);
 
 	if (event == FALL_EVENT_NEAR_FALL && updateState)
 	{
